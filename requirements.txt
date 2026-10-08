@@ -9,6 +9,9 @@ openpyxl
 pandas
 openai
 python-dotenv
+google-auth
+google-cloud-storage
+requests
 fpdf2
 rapidocr-onnxruntime
 onnxruntime

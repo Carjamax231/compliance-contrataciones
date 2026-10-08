@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
+import logging
 import re
 
-from app.models.schemas import DocumentoAnalizado, PreguntaSeguimiento, SesionCompliance
+from app.models.schemas import (
+    DocumentoAnalizado,
+    HallazgoAnalista,
+    PreguntaSeguimiento,
+    SesionCompliance,
+)
+
+logger = logging.getLogger(__name__)
 
 _QA_SECTION = "## Rúbrica del documento (Analista)"
 _QA_SECTION_ALT = "## Respuestas de seguimiento / cuestionario"
 _QA_SECTION_ALT2 = "## Respuestas de seguimiento"
+
+# Estados que cuentan como hallazgo en el informe de usuario / JSON Nest.
+_ESTADOS_HALLAZGO = frozenset({"no", "parcial", "no_consta"})
 
 
 def pregunta_pendiente(doc: DocumentoAnalizado) -> PreguntaSeguimiento | None:
@@ -48,7 +59,11 @@ def aplicar_rubrica_agente(
     preguntas: list[PreguntaSeguimiento],
     rubrica_raw: object,
 ) -> None:
-    """Rellena cada ítem de la rúbrica con la respuesta del Analista."""
+    """Rellena cada ítem con estado/respuesta/ref del Analista.
+
+    Empareja solo por código oficial o id de pregunta (qN). Sin fallback
+    posicional. No sobrescribe campos del cuestionario MD.
+    """
     by_id: dict[str, dict] = {}
     items: list = []
     if isinstance(rubrica_raw, list):
@@ -63,13 +78,10 @@ def aplicar_rubrica_agente(
             if pid:
                 by_id[pid] = item
 
-    for i, p in enumerate(preguntas, start=1):
-        item = by_id.get(p.id.lower()) or by_id.get(f"q{i}")
+    for p in preguntas:
+        item = by_id.get(p.id.lower()) if p.id else None
         if item is None and p.codigo_pregunta:
             item = by_id.get(p.codigo_pregunta.lower())
-        if item is None and i - 1 < len(items):
-            cand = items[i - 1]
-            item = cand if isinstance(cand, dict) else None
         if not item:
             p.respondida = True
             p.respondida_por = "agente"
@@ -82,80 +94,352 @@ def aplicar_rubrica_agente(
         p.estado = estado  # type: ignore[assignment]
         p.respuesta = resp or f"Estado: {estado}"
         p.ref = str(ref).strip() if ref not in (None, "") else None
-        for campo in (
-            "codigo_pregunta",
-            "fundamento_legal",
-            "rango_criticidad",
-            "accion_legal",
-            "advertencia_gerencia",
-        ):
-            val = item.get(campo)
-            if val not in (None, ""):
-                setattr(p, campo, str(val).strip())
-            elif campo == "codigo_pregunta" and p.codigo_pregunta:
-                continue  # conservar código del MD oficial
+        # Conservar codigo/fundamento/criticidad/acción/advertencia del MD.
         p.respondida = True
         p.respondida_por = "agente"
 
 
+def verificar_integridad_rubrica(
+    preguntas: list[PreguntaSeguimiento],
+    *,
+    codigos_oficiales: set[str] | None = None,
+) -> list[str]:
+    """Valida fidelidad texto/código post-apply. Devuelve warnings (no lanza)."""
+    avisos: list[str] = []
+    oficiales = {c.lower() for c in (codigos_oficiales or set()) if c}
+    for p in preguntas:
+        cod = (p.codigo_pregunta or "").strip()
+        if oficiales and cod and cod.lower() not in oficiales:
+            msg = f"código ajeno al cuestionario: {cod} ({p.id})"
+            avisos.append(msg)
+            logger.warning("Integridad rúbrica: %s", msg)
+        if not cod and oficiales:
+            msg = f"ítem sin codigo_pregunta: {p.id}"
+            avisos.append(msg)
+            logger.warning("Integridad rúbrica: %s", msg)
+        # Heurística: respuesta que cita otro código del cuestionario
+        if cod and p.respuesta and oficiales:
+            otros = [
+                c for c in oficiales
+                if c != cod.lower() and re.search(
+                    rf"\b{re.escape(c)}\b", p.respuesta or "", re.IGNORECASE
+                )
+            ]
+            if otros:
+                msg = (
+                    f"{cod}: respuesta menciona otro(s) código(s) "
+                    f"{', '.join(otros[:3])}"
+                )
+                avisos.append(msg)
+                logger.warning("Integridad rúbrica: %s", msg)
+    return avisos
+
+
+def _es_critico(rango: str | None) -> bool:
+    u = (rango or "").upper()
+    return "5" in u or "CRÍTIC" in u or "CRITIC" in u
+
+
+def _es_relevante(rango: str | None) -> bool:
+    u = (rango or "").upper()
+    return "3" in u or "RELEVANT" in u
+
+
+def calcular_estatus_desde_preguntas(
+    preguntas: list[PreguntaSeguimiento],
+    *,
+    tipo_coincide: bool = True,
+) -> str:
+    """Verde / Amarillo / Rojo según criticidad de hallazgos (sin N/A)."""
+    if not tipo_coincide:
+        return "Rojo"
+    worst = "Verde"
+    for p in preguntas:
+        est = (p.estado or "").lower()
+        if est in {"si", "na"}:
+            continue
+        if est in _ESTADOS_HALLAZGO:
+            if _es_critico(p.rango_criticidad):
+                return "Rojo"
+            if worst != "Rojo":
+                worst = "Amarillo"
+    return worst
+
+
+def construir_hallazgos_analista(
+    preguntas: list[PreguntaSeguimiento],
+) -> list[HallazgoAnalista]:
+    """Solo ítems no conformes (excluye si/na). Sin N/A en el JSON de Nest."""
+    out: list[HallazgoAnalista] = []
+    for p in preguntas:
+        est = (p.estado or "").lower()
+        if est not in _ESTADOS_HALLAZGO:
+            continue
+        if est == "na":
+            continue
+        out.append(
+            HallazgoAnalista(
+                codigo_pregunta=(p.codigo_pregunta or p.id or "").strip(),
+                pregunta_evaluada=p.texto,
+                fundamento_legal=p.fundamento_legal,
+                rango_criticidad=p.rango_criticidad,
+                accion_legal=p.accion_legal,
+                advertencia_gerencia=p.advertencia_gerencia,
+                estado=est if est in {"no", "parcial", "no_consta"} else "no_consta",  # type: ignore[arg-type]
+                respuesta=p.respuesta,
+                ref=p.ref,
+            )
+        )
+    return out
+
+
+def _fundamento_para_json(
+    fundamento: str | None,
+    *,
+    accion: str | None = None,
+    max_chars: int = 520,
+) -> str | None:
+    """Cita compacta priorizando artículos mencionados en la acción legal.
+
+    En varios MD la «Normativa principal» repite Art. 78 LCP genérico; la norma
+    útil (p. ej. Art. 13 SUNAI) está en complementaria. Preferimos las citas
+    de la acción/advertencia cuando aparecen en el texto completo.
+    """
+    if not fundamento:
+        return None
+    t = re.sub(r"\*+", "", str(fundamento)).strip()
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"^\s*Normativa\s+principal\s*", "", t, flags=re.IGNORECASE).strip()
+
+    nums: list[str] = []
+    for src in (accion or "",):
+        nums.extend(re.findall(r"(?:Art\.?|Artículo)\s*(\d+(?:\.\d+)?)", src, flags=re.I))
+    # También números sueltos tipo «91.1 LOCGR» / «13 SUNAI»
+    nums.extend(re.findall(r"\b(\d+(?:\.\d+)?)\s*(?:SUNAI|LOCGR|LOPA|LCP|RLCP|LCC)\b", accion or "", flags=re.I))
+    # únicos preservando orden
+    seen: set[str] = set()
+    nums_u: list[str] = []
+    for n in nums:
+        root = n.split(".")[0]
+        if root not in seen:
+            seen.add(root)
+            nums_u.append(root)
+
+    bloques = re.split(r"(?=Artículo\s+\d)", t, flags=re.IGNORECASE)
+    bloques = [b.strip() for b in bloques if b.strip()]
+    elegidos: list[str] = []
+    if nums_u and bloques:
+        for b in bloques:
+            mnum = re.match(r"Artículo\s+(\d+)", b, flags=re.IGNORECASE)
+            if mnum and mnum.group(1) in nums_u:
+                # Primera frase / ~280 chars del artículo
+                breve = b[:280].rstrip()
+                if not breve.endswith("."):
+                    punto = breve.find(". ")
+                    if punto > 40:
+                        breve = breve[: punto + 1]
+                elegidos.append(breve)
+            if len(elegidos) >= 2:
+                break
+    if not elegidos and bloques:
+        # Primer artículo (principal) acotado
+        elegidos = [bloques[0][:320].rstrip()]
+
+    out = " ".join(elegidos).strip()
+    if len(out) > max_chars:
+        out = out[:max_chars].rstrip() + "…"
+    return out or None
+
+
+def construir_json_analista(
+    *,
+    nombre_documento: str,
+    tipo_contrato: str,
+    estatus_global: str,
+    hallazgos: list[HallazgoAnalista],
+) -> dict:
+    """Parte 2 del formato Mariana (objeto estructurado)."""
+    return {
+        "documento_evaluado": nombre_documento,
+        "tipo_contrato": tipo_contrato,
+        "estatus_global": estatus_global,
+        "hallazgos": [
+            {
+                "codigo_pregunta": h.codigo_pregunta,
+                "pregunta_evaluada": h.pregunta_evaluada,
+                "fundamento_legal": _fundamento_para_json(
+                    h.fundamento_legal, accion=h.accion_legal
+                ),
+                "rango_criticidad": h.rango_criticidad,
+                "accion_legal": h.accion_legal,
+                "advertencia_gerencia": h.advertencia_gerencia,
+            }
+            for h in hallazgos
+        ],
+    }
+
+
+def _fundamento_corto(fundamento: str | None, *, max_chars: int = 280) -> str:
+    """Cita breve para el informe de usuario (el JSON completo va al Jurídico)."""
+    t = re.sub(r"\*+", "", str(fundamento or "")).strip()
+    t = re.sub(r"\s+", " ", t)
+    if not t:
+        return "fundamento pendiente de ampliación del corpus"
+    # Preferir el bloque de normativa principal si existe
+    m = re.search(
+        r"(?:Normativa principal\s*)?((?:Art[ií]culo|Art\.?)[^.]{0,200}\.)",
+        t,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        t = m.group(1).strip()
+    if len(t) > max_chars:
+        t = t[:max_chars].rstrip() + "…"
+    return t
+
+
+def construir_informe_usuario_markdown(
+    *,
+    nombre_documento: str,
+    tipo_contrato: str,
+    estatus_global: str,
+    preguntas: list[PreguntaSeguimiento],
+) -> str:
+    """Informe legal en prosa continua para el usuario.
+
+    Sin N/A, sin emojis, sin listar el texto completo de cada pregunta.
+    El fundamento se muestra abreviado; el JSON estructurado conserva el detalle.
+    """
+    aplicables = [p for p in preguntas if (p.estado or "").lower() != "na"]
+    aciertos = [p for p in aplicables if (p.estado or "").lower() == "si"]
+    hallazgos = [
+        p for p in aplicables if (p.estado or "").lower() in _ESTADOS_HALLAZGO
+    ]
+
+    explicacion = {
+        "Verde": (
+            "los puntos evaluados para este tipo de contrato resultan conformes"
+        ),
+        "Amarillo": (
+            "existen observaciones formales o hallazgos relevantes/ordinarios "
+            "que admiten subsanación"
+        ),
+        "Rojo": (
+            "se identificó al menos un hallazgo crítico o una inconsistencia "
+            "grave que requiere atención inmediata"
+        ),
+    }.get(estatus_global, "corresponde revisar el detalle de hallazgos")
+
+    partes: list[str] = [
+        (
+            f"He finalizado la revisión técnica y legal del documento "
+            f"«{nombre_documento}», correspondiente a un contrato de "
+            f"{tipo_contrato or 'N/D'}."
+        ),
+        (
+            f"El estatus global del documento es {estatus_global}: "
+            f"{explicacion}. "
+            f"Se valoraron {len(aplicables)} ítems aplicables a este tipo de "
+            f"contrato ({len(aciertos)} conformes y {len(hallazgos)} con "
+            f"observación o incumplimiento)."
+        ),
+    ]
+
+    if aciertos:
+        ejemplos = []
+        for p in aciertos[:5]:
+            cod = p.codigo_pregunta or p.id
+            breve = (p.respuesta or "conforme").strip().rstrip(".")
+            if len(breve) > 120:
+                breve = breve[:120].rstrip() + "…"
+            ejemplos.append(f"{cod} ({breve})")
+        extra = ""
+        if len(aciertos) > 5:
+            extra = f" y {len(aciertos) - 5} punto(s) adicional(es) conforme(s)"
+        partes.append(
+            "Entre los aspectos que cumplen se destacan: "
+            + "; ".join(ejemplos)
+            + extra
+            + "."
+        )
+
+    if hallazgos:
+        partes.append("A continuación se exponen los hallazgos relevantes.")
+        for i, p in enumerate(hallazgos, start=1):
+            cod = p.codigo_pregunta or p.id
+            est = (p.estado or "no").lower()
+            grado = {
+                "no": "incumplimiento",
+                "parcial": "cumplimiento parcial",
+                "no_consta": "ausencia de evidencia suficiente en el documento",
+            }.get(est, "observación")
+            cuerpo = (p.respuesta or "").strip().rstrip(".")
+            if not cuerpo or cuerpo.lower().startswith("estado:"):
+                cuerpo = "No se constató el cumplimiento del control requerido"
+            if len(cuerpo) > 220:
+                cuerpo = cuerpo[:220].rstrip() + "…"
+            fund = _fundamento_corto(p.fundamento_legal)
+            crit = (p.rango_criticidad or "N/D").strip()
+            accion = (p.accion_legal or "").strip()
+            adv = (p.advertencia_gerencia or "").strip()
+            ref = (p.ref or "").strip()
+
+            cuerpo = cuerpo.rstrip(".")
+            fund = fund.rstrip(".")
+            bloque = (
+                f"Hallazgo {i} ({cod}, criticidad {crit}): se observa "
+                f"{grado}. {cuerpo}. Fundamento: {fund}."
+            )
+            if accion:
+                if len(accion) > 220:
+                    accion = accion[:220].rstrip() + "…"
+                bloque += f" Acción recomendada: {accion.rstrip('.')}."
+            if adv:
+                if len(adv) > 180:
+                    adv = adv[:180].rstrip() + "…"
+                bloque += f" Advertencia a la gerencia: {adv.rstrip('.')}."
+            if ref and ref.lower() != "null":
+                bloque += f" Evidencia: {ref}."
+            partes.append(bloque)
+    else:
+        partes.append(
+            "No se registraron hallazgos para los ítems aplicables a este "
+            "tipo de contrato."
+        )
+
+    partes.append(
+        "Este informe se limita a la revisión del documento cargado; "
+        "el dictamen jurídico del expediente podrá integrar estos hallazgos "
+        "con el resto de las piezas del procedimiento."
+    )
+    return "\n\n".join(partes).rstrip() + "\n"
+
+
 def resumen_rubrica_chat(doc: DocumentoAnalizado) -> str:
-    """Texto breve de la rúbrica para el mensaje post-upload."""
-    if not doc.preguntas_seguimiento:
-        return ""
+    """Resumen corto post-upload: estatus + extracto del informe (sin rúbrica)."""
+    if doc.informe_markdown.strip():
+        # Primeras líneas del informe de usuario
+        lines = [ln for ln in doc.informe_markdown.splitlines() if ln.strip()]
+        return "\n".join(lines[:12])
     hechas, total = progreso_cuestionario(doc)
     estatus = doc.estatus_global or ("Verde" if doc.cumple else "Amarillo")
-    lineas = [
-        f"Estatus global: {estatus}",
-        f"Rúbrica ({hechas}/{total} ítems):",
-        "",
-    ]
-    for i, p in enumerate(doc.preguntas_seguimiento, start=1):
-        est = (p.estado or "?").upper()
-        ref = f" [{p.ref}]" if p.ref else ""
-        cod = f"{p.codigo_pregunta} · " if p.codigo_pregunta else ""
-        lineas.append(f"{i}. [{est}] {cod}{p.texto}")
-        if p.respuesta:
-            lineas.append(f"   → {p.respuesta}{ref}")
-        lineas.append("")
-    return "\n".join(lineas).rstrip()
+    return (
+        f"Estatus global: {estatus}. Ítems evaluados: {hechas}/{total} "
+        f"(solo tipo de contrato de la sesión)."
+    )
 
 
 def sincronizar_informe_documento(doc: DocumentoAnalizado) -> None:
-    """Reescribe la sección de rúbrica del informe desde el estado actual."""
+    """Asegura informe de usuario sin sección de rúbrica tabular."""
     base = doc.informe_markdown or ""
     for marker in (_QA_SECTION, _QA_SECTION_ALT, _QA_SECTION_ALT2):
         if marker in base:
             base = base.split(marker)[0].rstrip()
             break
-    base = re.sub(r"\n{3,}", "\n\n", base).rstrip()
-
-    if not doc.preguntas_seguimiento:
-        doc.informe_markdown = base
-        return
-
-    hechas, total = progreso_cuestionario(doc)
-    lineas = [
-        "",
-        _QA_SECTION,
-        "",
-        f"Progreso: {hechas}/{total} valorados por el Analista.",
-        "",
-    ]
-    for i, p in enumerate(doc.preguntas_seguimiento, start=1):
-        est = p.estado or ("ok" if p.respondida else "pendiente")
-        lineas.append(f"### Ítem {i} ({est})")
-        lineas.append("")
-        lineas.append(p.texto)
-        lineas.append("")
-        if p.respondida and p.respuesta:
-            lineas.append(f"**Respuesta del Analista:** {p.respuesta}")
-            if p.ref:
-                lineas.append(f"**Evidencia / ref:** {p.ref}")
-        else:
-            lineas.append("**Respuesta del Analista:** _(pendiente)_")
-        lineas.append("")
-
-    doc.informe_markdown = (base + "\n" + "\n".join(lineas)).strip() + "\n"
+    # Quitar bloque de cobertura técnica si quedó en el MD del LLM
+    if "### Cobertura de rúbrica" in base:
+        base = base.split("### Cobertura de rúbrica")[0].rstrip()
+    doc.informe_markdown = re.sub(r"\n{3,}", "\n\n", base).rstrip() + ("\n" if base else "")
 
 
 def registrar_respuesta(

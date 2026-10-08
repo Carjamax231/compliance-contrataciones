@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from app.agents.knowledge.storage import leer_texto
 from app.models.schemas import Modalidad, TipoDocumento
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,9 @@ _TIPO_PREF_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Tope de fundamento en prompt compacto (antes hasta 1800 → hinchaba lotes).
+_FUNDAMENTO_COMPACTO_MAX = 280
+
 
 @dataclass(frozen=True)
 class ItemCuestionario:
@@ -93,7 +97,7 @@ def ruta_cuestionario(modalidad: Modalidad, tipo: TipoDocumento) -> Path:
 
 
 def existe_cuestionario(modalidad: Modalidad, tipo: TipoDocumento) -> bool:
-    return ruta_cuestionario(modalidad, tipo).is_file()
+    return cargar_cuestionario(modalidad, tipo) is not None
 
 
 def _limpiar(txt: str) -> str:
@@ -224,17 +228,14 @@ def cargar_cuestionario(
     tipo: TipoDocumento,
 ) -> CuestionarioDocumento | None:
     path = ruta_cuestionario(modalidad, tipo)
-    if not path.is_file():
-        return None
-    try:
-        markdown = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        logger.warning("No se pudo leer cuestionario %s: %s", path, exc)
+    blob = f"{modalidad.value}/{tipo.value}.md"
+    markdown = leer_texto(local_path=path, gcs_blob=blob, kind="cuestionario")
+    if markdown is None:
         return None
 
     items = _parse_items(markdown)
     if not items:
-        logger.warning("Cuestionario sin ítems parseados: %s", path)
+        logger.warning("Cuestionario sin ítems parseados: %s", blob)
 
     return CuestionarioDocumento(
         modalidad=modalidad,
@@ -249,25 +250,135 @@ def textos_preguntas(cuest: CuestionarioDocumento) -> list[str]:
     return [it.texto for it in cuest.items]
 
 
-def formato_cuestionario_compacto(cuest: CuestionarioDocumento) -> str:
-    """Versión liviana para el LLM (sin acción/advertencia largas; esas viven en BD).
+def alcance_tipo_contrato(texto: str) -> frozenset[str] | None:
+    """Tipos de contrato a los que aplica la pregunta.
 
-    Si el fundamento trae texto íntegro de artículos (formato detallado), se deja
-    más margen para que el Analista cite sin inventar.
+    None = aplica a BIENES, OBRAS y SERVICIOS.
+    frozenset({'BIENES'}) = solo ese tipo (el resto se excluye del pipeline).
     """
+    raw = (texto or "").strip()
+    if not raw:
+        return None
+
+    pref = _TIPO_PREF_RE.match(raw)
+    if pref:
+        g = pref.group(1).upper()
+        if g in {"BIENES", "OBRAS", "SERVICIOS"}:
+            return frozenset({g})
+
+    tl = raw.lower()
+    # Preguntas que aplican a obra O servicio (no bienes).
+    if re.search(
+        r"obra o se prestar[ií]a el servicio|obra o(?:\s+se)?\s+servicio|"
+        r"ejecutar[ií]a la obra o|"
+        r"\(servicios\s*/\s*obras\)|servicios\s*/\s*obras|"
+        r"estructura de costos|an[aá]lisis de precios unitarios|\bapu\b",
+        tl,
+    ):
+        return frozenset({"OBRAS", "SERVICIOS"})
+
+    flags: set[str] = set()
+    if re.search(
+        r"\(bienes\)|adquisici[oó]n de bienes|bienes a adquirir|"
+        r"caracter[ií]sticas de los bienes|entrega de los bienes|"
+        r"entrega de bienes|para (la )?adquisici[oó]n de bienes|"
+        r"forma de entrega de los bienes|plazos para la entrega de bienes|"
+        r"condiciones para la entrega de bienes|"
+        r"los bienes una vez recibidos|"
+        r"especificaciones t[eé]cnicas de los bienes|"
+        r"contrataci[oó]n de bienes|"
+        r"cantidades del bien|"
+        r"bienes de gran importancia|"
+        r"20\.?000\s*ucau|art\.?\s*77\.1\b|"
+        r"no podr[aá] ser menor de 7 d[ií]as h[aá]biles",
+        tl,
+    ):
+        flags.add("BIENES")
+    if re.search(
+        r"\(servicios\)|prestaci[oó]n de servicios|servicios a prestar|"
+        r"caracter[ií]sticas de los servicios|para (la )?prestaci[oó]n|"
+        r"forma de prestaci[oó]n del servicio|"
+        r"plazos para la prestaci[oó]n del servicio|"
+        r"condiciones para la prestaci[oó]n del servicio|"
+        r"los servicios una vez recibidos|"
+        r"especificaciones t[eé]cnicas de los servicios|"
+        r"contrataci[oó]n de servicios|"
+        r"alcance del servicio|"
+        r"30\.?000\s*ucau|art\.?\s*77\.2\b|"
+        r"no podr[aá] ser menor de 9 d[ií]as h[aá]biles",
+        tl,
+    ):
+        flags.add("SERVICIOS")
+    if re.search(
+        r"\(obras\)|ejecuci[oó]n de (la )?obra|obras a ejecutar|"
+        r"caracter[ií]sticas de las obras|listas de cantidades|"
+        r"forma de ejecuci[oó]n de las obras|"
+        r"plazos para la ejecuci[oó]n de la obra|"
+        r"condiciones para la ejecuci[oó]n de la obra|"
+        r"las obras una vez recibidas|"
+        r"obra a ejecutar|especificaciones t[eé]cnicas de la obra|"
+        r"ejecuci[oó]n de una obra|"
+        r"proyecto como la obra|proyecto y la (ejecuci[oó]n de la )?obra|"
+        r"anteproyecto|cantidades de obra|"
+        r"50\.?000\s*ucau|art\.?\s*77\.3\b|"
+        r"no podr[aá] ser menor de 11 d[ií]as h[aá]biles",
+        tl,
+    ):
+        flags.add("OBRAS")
+
+    if len(flags) == 1:
+        return frozenset(flags)
+    if flags == {"OBRAS", "SERVICIOS"}:
+        return frozenset(flags)
+    # Si menciona varios tipos de forma excluyente (bienes vs servicios vs obras
+    # en ítems hermanos), no mezclar: None = transversal.
+    return None
+
+
+def item_aplica_a_tipo(texto: str, tipo_contratacion: str) -> bool:
+    """True si la pregunta debe evaluarse con el tipo de contrato de la sesión."""
+    tipo = (tipo_contratacion or "").strip().upper()
+    if not tipo:
+        return True
+    alcance = alcance_tipo_contrato(texto)
+    if alcance is None:
+        return True
+    return tipo in alcance
+
+
+def particionar_items_por_tipo(
+    items: list[ItemCuestionario] | tuple[ItemCuestionario, ...],
+    tipo_contratacion: str,
+) -> tuple[list[ItemCuestionario], list[ItemCuestionario]]:
+    """Separa ítems a evaluar con LLM vs auto-na por tipo de contrato."""
+    aplicables: list[ItemCuestionario] = []
+    na_auto: list[ItemCuestionario] = []
+    for it in items:
+        if item_aplica_a_tipo(it.texto, tipo_contratacion):
+            aplicables.append(it)
+        else:
+            na_auto.append(it)
+    return aplicables, na_auto
+
+
+def formato_cuestionario_compacto(
+    cuest: CuestionarioDocumento,
+    *,
+    items: list[ItemCuestionario] | tuple[ItemCuestionario, ...] | None = None,
+) -> str:
+    """Versión liviana para el LLM (sin acción/advertencia largas)."""
+    usados = tuple(items) if items is not None else cuest.items
     lineas: list[str] = [
         f"Cuestionario oficial — {cuest.tipo_documento.value} "
-        f"({len(cuest.items)} ítems). Responde TODOS los códigos."
+        f"({len(usados)} ítems a evaluar). Responde TODOS los códigos listados."
     ]
-    for it in cuest.items:
+    for it in usados:
         lineas.append(f"- {it.codigo}: {it.texto}")
         if it.rango_criticidad:
             lineas.append(f"  Criticidad: {it.rango_criticidad}")
         if it.fundamento_legal:
-            fund = it.fundamento_legal
-            # Cita corta vs. texto íntegro embebido en el MD
-            limite = 1800 if len(fund) > 400 else 220
-            if len(fund) > limite:
-                fund = fund[:limite].rstrip() + "…"
+            fund = it.fundamento_legal.strip()
+            if len(fund) > _FUNDAMENTO_COMPACTO_MAX:
+                fund = fund[:_FUNDAMENTO_COMPACTO_MAX].rstrip() + "…"
             lineas.append(f"  Fundamento: {fund}")
     return "\n".join(lineas)

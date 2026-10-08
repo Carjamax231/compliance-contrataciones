@@ -15,6 +15,11 @@ from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
 
 from app.agents.cuestionario import (
     aplicar_rubrica_agente,
+    calcular_estatus_desde_preguntas,
+    construir_hallazgos_analista,
+    construir_informe_usuario_markdown,
+    construir_json_analista,
+    verificar_integridad_rubrica,
     resumen_rubrica_chat,
     sincronizar_informe_documento,
 )
@@ -23,6 +28,7 @@ from app.agents.knowledge import etiqueta_modalidad
 from app.agents.knowledge.cuestionarios_loader import (
     cargar_cuestionario,
     formato_cuestionario_compacto,
+    particionar_items_por_tipo,
 )
 from app.agents.modalities import get_modalidad_agent
 from app.agents.orchestrator import crear_sesion, ejecutar_dictamen_juridico, procesar_mensaje
@@ -56,6 +62,7 @@ from app.models.schemas import (
     JuridicoResponse,
     MensajeRequest,
     MensajeResponse,
+    MetricasAnalisis,
     Modalidad,
     MontoClave,
     NivelRiesgo,
@@ -63,6 +70,7 @@ from app.models.schemas import (
     PlazoClave,
     PreguntaSeguimiento,
     RespuestasDocumentoRequest,
+    SandboxAnalizarResponse,
     SesionCompliance,
     SesionesListaResponse,
     SesionResumen,
@@ -505,6 +513,50 @@ def abrir_sesion(body: CrearSesionRequest | None = None) -> CrearSesionResponse:
     return CrearSesionResponse(sesion=sesion, mensaje=mensaje)
 
 
+@router.post("/sandbox/analizar", response_model=SandboxAnalizarResponse)
+async def sandbox_analizar(
+    archivo: UploadFile = File(...),
+    nomenclatura: str = Form(...),
+    modalidad: Modalidad = Form(...),
+    tipo_contratacion: TipoContratacion = Form(...),
+    tipo_documento: TipoDocumento = Form(...),
+) -> SandboxAnalizarResponse:
+    """Flujo consolidado para el sandbox HTML: crea sesión + analiza documento."""
+    cuest_prev = cargar_cuestionario(modalidad, tipo_documento)
+    n_excluidos = 0
+    n_aplicables = 0
+    if cuest_prev and cuest_prev.items:
+        aplic, excl = particionar_items_por_tipo(
+            cuest_prev.items, tipo_contratacion.value
+        )
+        n_aplicables = len(aplic)
+        n_excluidos = len(excl)
+
+    sesion, _msg = crear_sesion(
+        nomenclatura=nomenclatura.strip(),
+        modalidad=modalidad,
+        tipo_contratacion=tipo_contratacion,
+    )
+    analisis_resp = await cargar_documento(
+        sesion.id,
+        archivo=archivo,
+        tipo_documento=tipo_documento,
+        tipo_documento_form=None,
+    )
+    sesion_fresh = _require_sesion(sesion.id)
+    doc = analisis_resp.documento
+    return SandboxAnalizarResponse(
+        sesion=sesion_fresh,
+        documento=doc,
+        informe_markdown=doc.informe_markdown or "",
+        json_analista=doc.json_analista or {},
+        metricas=doc.metricas or MetricasAnalisis(),
+        mensaje=analisis_resp.mensaje,
+        items_evaluados=n_aplicables or len(doc.preguntas_seguimiento or []),
+        items_excluidos_otro_tipo=n_excluidos,
+    )
+
+
 @router.post("/{sesion_id}/mensaje", response_model=MensajeResponse)
 def enviar_mensaje(sesion_id: str, body: MensajeRequest) -> MensajeResponse:
     try:
@@ -568,13 +620,22 @@ async def cargar_documento(
     agent = get_modalidad_agent(sesion.modalidad, sesion.tipo_contratacion)
     requisitos = agent.requisitos(tipo)
     cuest = cargar_cuestionario(sesion.modalidad, tipo)
+    tipo_ct = sesion.tipo_contratacion.value if sesion.tipo_contratacion else ""
+    items_llm = list(cuest.items) if cuest and cuest.items else []
+    items_excluidos: list = []
+    if cuest and cuest.items and tipo_ct:
+        items_llm, items_excluidos = particionar_items_por_tipo(cuest.items, tipo_ct)
+    # Solo preguntas del tipo de contrato: las de otro tipo no van al LLM ni al informe.
     preguntas = (
-        [it.texto for it in cuest.items]
-        if cuest and cuest.items
-        else agent.preguntas(tipo)
+        [it.texto for it in items_llm]
+        if items_llm
+        else (agent.preguntas(tipo) if not (cuest and cuest.items) else [])
     )
-    # Compacto para el LLM (el MD completo hincha el prompt y trunca el JSON)
-    cuestionario_md = formato_cuestionario_compacto(cuest) if cuest and cuest.items else None
+    cuestionario_md = (
+        formato_cuestionario_compacto(cuest, items=items_llm)
+        if cuest and items_llm
+        else None
+    )
     cuestionario_items = (
         [
             {
@@ -583,9 +644,9 @@ async def cargar_documento(
                 "rango_criticidad": it.rango_criticidad,
                 "fundamento_legal": it.fundamento_legal,
             }
-            for it in cuest.items
+            for it in items_llm
         ]
-        if cuest and cuest.items
+        if items_llm
         else None
     )
 
@@ -630,9 +691,9 @@ async def cargar_documento(
             nomenclatura=sesion.nomenclatura,
             docs_previos_resumen=docs_previos,
             nombre_archivo=nombre_seguro,
-            tipo_contratacion=(
-                sesion.tipo_contratacion.value if sesion.tipo_contratacion else ""
-            ),
+            tipo_contratacion=tipo_ct,
+            rubrica_prefill=None,
+            items_orden_completo=[it.codigo for it in items_llm] if items_llm else None,
         )
 
         preg_objs: list[PreguntaSeguimiento] = []
@@ -642,11 +703,12 @@ async def cargar_documento(
             str(tipo_detectado_raw).strip() if tipo_detectado_raw not in (None, "") else None
         )
 
-        # Rúbrica precargada: el Analista responde contra el documento (no el usuario)
+        # Solo ítems aplicables al tipo de contrato de la sesión.
         if tipo_coincide:
             seen_q: set[str] = set()
-            if cuest and cuest.items:
-                for it in cuest.items:
+            fuente_items = items_llm if items_llm else []
+            if fuente_items:
+                for it in fuente_items:
                     t = it.texto.strip()
                     if not t or t in seen_q:
                         continue
@@ -675,21 +737,20 @@ async def cargar_documento(
                 preg_objs,
                 analisis.get("rubrica") or analisis.get("respuestas_cuestionario"),
             )
+            if fuente_items:
+                verificar_integridad_rubrica(
+                    preg_objs,
+                    codigos_oficiales={it.codigo for it in fuente_items if it.codigo},
+                )
 
         observaciones = _parse_observaciones(
             analisis.get("observaciones") or analisis.get("hallazgos")
         )
-        estatus_raw = str(analisis.get("estatus_global") or "").strip()
-        estatus_global = None
-        for cand in ("Verde", "Amarillo", "Rojo"):
-            if estatus_raw.lower() == cand.lower():
-                estatus_global = cand
-                break
-        cumple = bool(analisis.get("cumple", False))
-        if estatus_global == "Verde":
-            cumple = True
-        elif estatus_global in {"Amarillo", "Rojo"}:
-            cumple = False
+        estatus_global = calcular_estatus_desde_preguntas(
+            preg_objs, tipo_coincide=tipo_coincide
+        )
+        # Observaciones críticas de identidad pueden forzar Rojo más abajo.
+        cumple = estatus_global == "Verde"
         if not tipo_coincide:
             cumple = False
             estatus_global = "Rojo"
@@ -731,6 +792,35 @@ async def cargar_documento(
         if len(texto_ext) > 80000:
             texto_ext = texto_ext[:80000] + "\n…[truncado en persistencia]"
 
+        hallazgos = construir_hallazgos_analista(preg_objs) if preg_objs else []
+        tipo_label = tipo_ct or (
+            sesion.tipo_contratacion.value if sesion.tipo_contratacion else "N/D"
+        )
+        json_analista = construir_json_analista(
+            nombre_documento=nombre_seguro,
+            tipo_contrato=tipo_label,
+            estatus_global=estatus_global or "Amarillo",
+            hallazgos=hallazgos,
+        )
+        informe_usuario = (
+            construir_informe_usuario_markdown(
+                nombre_documento=nombre_seguro,
+                tipo_contrato=tipo_label,
+                estatus_global=estatus_global or "Amarillo",
+                preguntas=preg_objs,
+            )
+            if preg_objs and tipo_coincide
+            else str(analisis.get("informe_markdown") or "")
+        )
+        met_raw = analisis.get("metricas") or {}
+        metricas = MetricasAnalisis(
+            latencia_ms=int(met_raw.get("latencia_ms") or 0),
+            tokens_prompt=int(met_raw.get("tokens_prompt") or 0),
+            tokens_completion=int(met_raw.get("tokens_completion") or 0),
+            tokens_total=int(met_raw.get("tokens_total") or 0),
+            llamadas_llm=int(met_raw.get("llamadas_llm") or 0),
+        )
+
         documento = DocumentoAnalizado(
             id=str(uuid.uuid4()),
             tipo=tipo,
@@ -739,8 +829,11 @@ async def cargar_documento(
             observaciones=observaciones,
             cumple=cumple,
             fecha_analisis=datetime.now(timezone.utc),
-            informe_markdown=str(analisis.get("informe_markdown", "")),
+            informe_markdown=informe_usuario,
             preguntas_seguimiento=preg_objs,
+            hallazgos=hallazgos,
+            json_analista=json_analista,
+            metricas=metricas,
             tipo_coincide=tipo_coincide,
             tipo_detectado=tipo_detectado,
             texto_extraido=texto_ext,
@@ -748,8 +841,7 @@ async def cargar_documento(
             hechos_clave=_parse_hechos_clave(analisis.get("hechos_clave")),
             estatus_global=estatus_global,  # type: ignore[arg-type]
         )
-        if preg_objs:
-            sincronizar_informe_documento(documento)
+        sincronizar_informe_documento(documento)
 
         sesion.documentos_analizados.append(documento)
         # Solo marcar el slot como auditado si el archivo es del tipo declarado
@@ -791,6 +883,8 @@ async def cargar_documento(
             documento=documento,
             mensaje=msg,
             slots_pendientes=pendientes,
+            metricas=documento.metricas,
+            json_analista=documento.json_analista,
         )
     except _LLM_ERRORS as exc:
         raise _http_from_llm(exc) from exc

@@ -1,4 +1,4 @@
-"""Cliente LLM abstraído (Gemini vía API OpenAI-compatible + fallback por env)."""
+"""Cliente LLM abstraído (OpenAI-compatible + Vertex AI ADC + fallback por env)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import logging
 import os
 import re
 import time
+from contextvars import ContextVar
+from typing import Any
 
 from dotenv import load_dotenv
 from openai import (
@@ -24,6 +26,54 @@ load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
 
+# Credenciales ADC cacheadas para Vertex (refresh cuando expiran).
+_vertex_creds: Any | None = None
+
+# Acumulador de uso LLM por request (sandbox / métricas).
+_usage_ctx: ContextVar[dict[str, int] | None] = ContextVar("llm_usage", default=None)
+
+
+def reset_llm_usage() -> None:
+    """Inicia contadores de tokens/llamadas para el análisis actual."""
+    _usage_ctx.set(
+        {
+            "tokens_prompt": 0,
+            "tokens_completion": 0,
+            "tokens_total": 0,
+            "llamadas_llm": 0,
+        }
+    )
+
+
+def snapshot_llm_usage() -> dict[str, int]:
+    """Copia los contadores actuales (ceros si no hay contexto)."""
+    cur = _usage_ctx.get()
+    if not cur:
+        return {
+            "tokens_prompt": 0,
+            "tokens_completion": 0,
+            "tokens_total": 0,
+            "llamadas_llm": 0,
+        }
+    return dict(cur)
+
+
+def _registrar_usage(response: Any) -> None:
+    cur = _usage_ctx.get()
+    if cur is None:
+        return
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        cur["llamadas_llm"] = cur.get("llamadas_llm", 0) + 1
+        return
+    prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+    completion = int(getattr(usage, "completion_tokens", 0) or 0)
+    total = int(getattr(usage, "total_tokens", 0) or (prompt + completion))
+    cur["tokens_prompt"] = cur.get("tokens_prompt", 0) + prompt
+    cur["tokens_completion"] = cur.get("tokens_completion", 0) + completion
+    cur["tokens_total"] = cur.get("tokens_total", 0) + total
+    cur["llamadas_llm"] = cur.get("llamadas_llm", 0) + 1
+
 JSON_SHAPE_HINT = (
     '{"resumen": str, "cumple": bool, '
     '"estatus_global": "Verde"|"Amarillo"|"Rojo", '
@@ -34,9 +84,7 @@ JSON_SHAPE_HINT = (
     '"rango_criticidad": str|null, "accion_legal": str|null, '
     '"advertencia_gerencia": str|null}], '
     '"rubrica": [{"id": str, "estado": "si"|"no"|"parcial"|"na"|"no_consta", '
-    '"respuesta": str, "ref": str|null, "codigo_pregunta": str|null, '
-    '"fundamento_legal": str|null, "rango_criticidad": str|null, '
-    '"accion_legal": str|null, "advertencia_gerencia": str|null}], '
+    '"respuesta": str, "ref": str|null}], '
     '"informe_markdown": str, '
     '"hechos_clave": {'
     '"montos": [{"etiqueta": str, "texto": str, "valor_num": number|null, "moneda": str|null}], '
@@ -94,6 +142,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _llm_provider() -> str:
+    """openai = API key + base URL; vertex = ADC + endpoint Vertex OpenAI-compatible."""
+    raw = (os.getenv("LLM_PROVIDER") or "openai").strip().lower()
+    if raw in {"vertex", "vertexai", "vertex_ai"}:
+        return "vertex"
+    return "openai"
+
+
 def _model() -> str:
     model = (os.getenv("GEMINI_MODEL") or os.getenv("OPENAI_MODEL") or "").strip()
     if not model:
@@ -110,20 +166,76 @@ def _timeout() -> float:
     return min(max(t, 15.0), _TIMEOUT_PRIMARIO_TOPE)
 
 
+def _vertex_base_url() -> str:
+    """Endpoint OpenAI-compatible de Vertex; GEMINI_BASE_URL puede overridear."""
+    explicit = (os.getenv("GEMINI_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    project = (
+        os.getenv("GCP_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT") or ""
+    ).strip()
+    location = (os.getenv("VERTEX_LOCATION") or "us-east4").strip()
+    if not project:
+        raise RuntimeError(
+            "LLM_PROVIDER=vertex requiere GCP_PROJECT_ID (o GOOGLE_CLOUD_PROJECT), "
+            "o bien GEMINI_BASE_URL con el endpoint Vertex completo."
+        )
+    return (
+        f"https://{location}-aiplatform.googleapis.com/v1/"
+        f"projects/{project}/locations/{location}/endpoints/openapi"
+    )
+
+
+def _vertex_access_token() -> str:
+    """Access token ADC (SA de Cloud Run en prod; gcloud ADC en local)."""
+    global _vertex_creds
+    try:
+        from google.auth import default as google_auth_default
+        from google.auth.transport.requests import Request
+    except ImportError as exc:
+        raise RuntimeError(
+            "LLM_PROVIDER=vertex requiere el paquete google-auth. "
+            "Ejecuta: pip install google-auth requests"
+        ) from exc
+
+    if _vertex_creds is None:
+        _vertex_creds, _ = google_auth_default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+    if not _vertex_creds.valid:
+        _vertex_creds.refresh(Request())
+    token = getattr(_vertex_creds, "token", None)
+    if not token:
+        raise RuntimeError(
+            "No se pudo obtener access token ADC para Vertex AI. "
+            "En local: gcloud auth application-default login. "
+            "En Cloud Run: usa la SA con roles/aiplatform.user."
+        )
+    return token
+
+
 def _client() -> OpenAI:
-    """Cliente primario; URL/clave/modelo solo desde GEMINI_* (o OPENAI_*)."""
+    """Cliente primario: Vertex (ADC) u OpenAI-compatible (API key)."""
+    if _llm_provider() == "vertex":
+        return OpenAI(
+            api_key=_vertex_access_token(),
+            base_url=_vertex_base_url(),
+            timeout=_timeout(),
+        )
+
     api_key = (os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
     api_key = api_key.strip("\"'")
     if not api_key:
         raise RuntimeError(
-            "GEMINI_API_KEY no está definida. Copia .env.example a .env y configura la clave."
+            "GEMINI_API_KEY no está definida. Copia .env.example a .env y configura la clave, "
+            "o usa LLM_PROVIDER=vertex con ADC."
         )
     base_url = (
         os.getenv("GEMINI_BASE_URL") or os.getenv("OPENAI_BASE_URL") or ""
     ).strip()
     if not base_url:
         raise RuntimeError("GEMINI_BASE_URL no está definida en el entorno.")
-    # ia-gateway (Qwen local) valida X-API-KEY; el SDK también manda Bearer.
+    # Gateways tipo Qwen/ia-gateway validan X-API-KEY; el SDK también manda Bearer.
     return OpenAI(
         api_key=api_key,
         base_url=base_url,
@@ -405,7 +517,7 @@ def _chat_create(
     messages: list,
     max_tokens: int,
     timeout: float | None = None,
-) -> str:
+) -> tuple[str, str | None]:
     kwargs: dict = {
         "model": model,
         "max_tokens": max_tokens,
@@ -414,7 +526,15 @@ def _chat_create(
     if timeout is not None:
         kwargs["timeout"] = timeout
     response = client.chat.completions.create(**kwargs)
-    return _respuesta_texto(response)
+    _registrar_usage(response)
+    finish = None
+    try:
+        finish = getattr(response.choices[0], "finish_reason", None)
+    except Exception:  # noqa: BLE001
+        finish = None
+    if finish:
+        logger.info("LLM finish_reason=%s model=%s max_tokens=%s", finish, model, max_tokens)
+    return _respuesta_texto(response), finish
 
 
 def _llamar_modelo(
@@ -424,6 +544,22 @@ def _llamar_modelo(
     max_tokens: int = 4096,
     timeout: float | None = None,
 ) -> str:
+    text, _finish = _llamar_modelo_meta(
+        system=system,
+        user_content=user_content,
+        max_tokens=max_tokens,
+        timeout=timeout,
+    )
+    return text
+
+
+def _llamar_modelo_meta(
+    *,
+    system: str,
+    user_content: str | list[dict],
+    max_tokens: int = 4096,
+    timeout: float | None = None,
+) -> tuple[str, str | None]:
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user_content},
@@ -893,14 +1029,17 @@ def _items_cuestionario_norm(
     return out
 
 
-def _formato_lote_items(items: list[dict]) -> str:
+def _formato_lote_items(items: list[dict], *, fund_max: int = 220) -> str:
     lineas: list[str] = []
     for it in items:
         linea = f"- {it['codigo']}: {it['texto']}"
         if it.get("criticidad"):
             linea += f" [{it['criticidad']}]"
-        if it.get("fundamento"):
-            linea += f"\n  Fundamento cuestionario: {it['fundamento']}"
+        fund = str(it.get("fundamento") or "").strip()
+        if fund:
+            if len(fund) > fund_max:
+                fund = fund[:fund_max].rstrip() + "…"
+            linea += f"\n  Fundamento cuestionario: {fund}"
         lineas.append(linea)
     return "\n".join(lineas)
 
@@ -1016,6 +1155,85 @@ def _texto_plano_documento(contenido: dict, chunks: list) -> str:
     return texto
 
 
+def _fila_no_consta(codigo: str, *, motivo: str = "sin valoración del modelo") -> dict:
+    return {
+        "id": codigo,
+        "estado": "no_consta",
+        "respuesta": f"Sin valoración explícita del modelo sobre este ítem ({motivo}).",
+        "ref": None,
+    }
+
+
+def _sanear_lote_rubrica(lote: list[dict], rub: list) -> list[dict]:
+    """Conserva solo filas cuyo id está en el lote; descarta basura cruzada.
+
+    El LLM solo aporta estado/respuesta/ref. Los N/A en ítems aplicables
+    (ya filtrados por tipo) se normalizan a no_consta.
+    """
+    permitidos = {str(it["codigo"]).strip().lower(): it["codigo"] for it in lote}
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in rub or []:
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("id") or item.get("codigo_pregunta") or "").strip()
+        if not cid or cid.lower() not in permitidos:
+            continue
+        key = cid.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        estado = str(item.get("estado") or "").strip().lower().replace(" ", "_")
+        if estado in {"n/a", "n.a.", "na", "no_aplica", "noaplica"}:
+            # Ítems del lote son aplicables: N/A del modelo = sin evidencia
+            estado = "no_consta"
+            resp = (
+                "No consta evidencia en el documento para este ítem aplicable "
+                "(N/A del modelo normalizado; el N/A por tipo de contrato "
+                "solo lo asigna el sistema)."
+            )
+        else:
+            resp = str(item.get("respuesta") or item.get("explicacion") or "").strip()
+        if re.search(r"\bsimulado\b", resp, re.IGNORECASE):
+            resp = re.sub(
+                r"\s*\([^)]*simulado[^)]*\)", "", resp, flags=re.IGNORECASE
+            ).strip()
+        ref = item.get("ref")
+        ref_s = str(ref).strip() if ref not in (None, "") else None
+        if ref_s and re.search(r"\bsimulado\b", ref_s, re.IGNORECASE):
+            ref_s = None
+        # Solo campos que el LLM puede aportar (MD manda el resto).
+        out.append(
+            {
+                "id": permitidos[key],
+                "estado": estado or "no_consta",
+                "respuesta": resp or f"Estado: {estado or 'no_consta'}",
+                "ref": ref_s,
+            }
+        )
+    return out
+
+
+def _completar_codigos_faltantes(
+    esperados: list[str],
+    rubrica: list,
+    *,
+    motivo: str = "código ausente tras lotes",
+) -> list[dict]:
+    """Rellena con no_consta los códigos esperados que no llegaron del LLM."""
+    have = {
+        str(r.get("id") or r.get("codigo_pregunta") or "").strip().lower()
+        for r in (rubrica or [])
+        if isinstance(r, dict)
+    }
+    out: list[dict] = [r for r in (rubrica or []) if isinstance(r, dict)]
+    for c in esperados:
+        if c and c.lower() not in have:
+            out.append(_fila_no_consta(c, motivo=motivo))
+            have.add(c.lower())
+    return out
+
+
 def _evaluar_lote_rubrica(
     *,
     system_experto: str,
@@ -1027,29 +1245,42 @@ def _evaluar_lote_rubrica(
     total_lotes: int,
     texto_doc: str,
 ) -> list[dict]:
+    ids = [it["codigo"] for it in lote]
     system = (
         (system_experto + "\n\n" if system_experto else "")
         + "ANALISTA — LOTE DE RÚBRICA.\n"
         "Responde CADA ítem del lote buscando evidencia EN EL DOCUMENTO.\n"
         "Estados: si | no | parcial | na | no_consta.\n"
-        f"Tipo de contrato de la sesión: «{tipo_contrato_label or 'N/D'}». "
-        "Si la pregunta es exclusiva de otro tipo, estado=na.\n"
-        f"Nomenclatura de sesión: «{nom}» (úsalo como contexto; no inventes).\n"
-        "id de cada ítem = código exacto del listado. "
-        "respuesta ≤ 40 palabras; ref con pág/bloque si puedes; "
-        "sin pegar acción legal ni advertencias largas.\n"
-        "Si estado=no o parcial: en 'respuesta' menciona el artículo y una cita "
-        "corta SOLO si está en el basamento recuperado o en el fundamento del "
-        "ítem; si no, di fundamento pendiente.\n"
+        f"Tipo de contrato de la sesión: «{tipo_contrato_label or 'N/D'}».\n"
+        f"Nomenclatura de sesión: «{nom}» (contexto; no inventes).\n"
+        "REGLAS ESTRICTAS DE ALINEACIÓN (1 fila = 1 código):\n"
+        f"- Debes devolver exactamente {len(ids)} filas; ids = {ids}.\n"
+        "- El campo id de cada fila DEBE ser exactamente el código listado; "
+        "la 'respuesta' y 'ref' deben responder ESA pregunta, nunca otra.\n"
+        "- Prohibido mezclar respuestas entre códigos o inventar ids.\n"
+        "- Prohibido inventar secciones, anexos o citas '(simulado)'. "
+        "Si no hay evidencia: estado=no_consta y ref=null.\n"
+        "- NO uses estado=na en este lote: los ítems ya son aplicables al tipo "
+        "de contrato de la sesión. Sin evidencia → no_consta.\n"
+        "- respuesta ≤ 40 palabras; ref con sección/pág real del documento.\n"
+        "- Si estado=no o parcial: en la respuesta puedes citar artículo SOLO "
+        "si está en el basamento recuperado o en el 'Fundamento cuestionario' "
+        "del ítem; si no hay cita, di 'fundamento pendiente de ampliación "
+        "del corpus' en la respuesta (no inventes artículos).\n"
+        "- No devuelvas fundamento_legal ni acción/advertencia: eso lo aporta "
+        "el cuestionario oficial.\n"
         f"SOLO JSON: {JSON_SHAPE_RUBRICA_LOTE}"
     )
-    fund_lote = "\n".join(
-        str(it.get("fundamento") or "") for it in lote if it.get("fundamento")
+    # Solo citas cortas para recuperar artículos; no volcar fundamentos íntegros.
+    fund_citas = " ".join(
+        str(it.get("fundamento") or "")[:180] for it in lote if it.get("fundamento")
     )
-    kb_lote = _bloque_basamento(fund_lote, limite_chars=3_500) if fund_lote.strip() else ""
+    kb_lote = (
+        _bloque_basamento(fund_citas, limite_chars=2_000) if fund_citas.strip() else ""
+    )
     user = (
         f"Documento: {nombre_doc}\n"
-        f"Lote {lote_idx}/{total_lotes} — ítems a evaluar:\n"
+        f"Lote {lote_idx}/{total_lotes} — ítems a evaluar (1:1):\n"
         f"{_formato_lote_items(lote)}\n\n"
         f"{kb_lote}\n\n"
         f"TEXTO DEL DOCUMENTO:\n{texto_doc}"
@@ -1063,7 +1294,7 @@ def _evaluar_lote_rubrica(
                 system=system,
                 user_content=(
                     "JSON inválido/truncado. Regenera SOLO el JSON del lote con "
-                    f"TODOS estos ids: {[it['codigo'] for it in lote]}.\n"
+                    f"TODOS estos ids exactamente: {ids}.\n"
                     f"Shape: {JSON_SHAPE_RUBRICA_LOTE}\nAnterior:\n{(raw or '')[:2000]}"
                 ),
                 max_tokens=4096,
@@ -1073,7 +1304,7 @@ def _evaluar_lote_rubrica(
             logger.warning("Lote de rúbrica %s/%s irreparable", lote_idx, total_lotes)
             return []
     rub = data.get("rubrica") if isinstance(data, dict) else None
-    return rub if isinstance(rub, list) else []
+    return _sanear_lote_rubrica(lote, rub if isinstance(rub, list) else [])
 
 
 def analizar_documento(
@@ -1090,10 +1321,15 @@ def analizar_documento(
     docs_previos_resumen: str = "",
     nombre_archivo: str = "",
     tipo_contratacion: str = "",
+    rubrica_prefill: list[dict] | None = None,
+    items_orden_completo: list[str] | None = None,
 ) -> dict:
     """Analiza un documento: identidad/coherencia + rúbrica por lotes."""
     from app.agents.knowledge import etiqueta_documento, etiqueta_tipo_contratacion
     from app.models.schemas import TipoContratacion
+
+    reset_llm_usage()
+    t0 = time.perf_counter()
 
     elementos = requisitos.get("elementos_requeridos") or []
     descripcion = requisitos.get("descripcion") or ""
@@ -1117,9 +1353,10 @@ def analizar_documento(
             )
         except (ValueError, KeyError):
             tipo_contrato_label = tipo_contratacion
+    # Citas cortas → recuperación selectiva (no volcar fundamentos largos).
     kb_slot = _bloque_basamento(
-        " ".join((it.get("fundamento") or "") for it in items),
-        limite_chars=3_500,
+        " ".join(str(it.get("fundamento") or "")[:180] for it in items),
+        limite_chars=2_000,
     )
     meta = contenido.get("canonico") or {}
     meta_txt = (
@@ -1277,15 +1514,15 @@ def analizar_documento(
     data.setdefault("rubrica", [])
     tipo_ok = _as_bool_local(data.get("tipo_coincide"), True)
 
-    # Rúbrica por lotes (solo si el tipo de documento coincide)
+    # Solo ítems aplicables al tipo (sin prefill N/A en el pipeline de usuario).
+    rubrica_acc: list = list(rubrica_prefill or [])
+    no_consta_fill = 0
     if tipo_ok and items:
-        # Si no había items estructurados pero sí markdown, avisar en log
         if not cuestionario_items and md_oficial and not preguntas:
             logger.info("Cuestionario MD presente sin ítems estructurados.")
 
         texto_doc = _texto_plano_documento(contenido, chunks)
-        esperados = [it["codigo"] for it in items]
-        rubrica_acc: list = list(data.get("rubrica") or [])
+        esperados_llm = [it["codigo"] for it in items]
         lotes = [
             items[i : i + _RUBRICA_LOTE_TAM]
             for i in range(0, len(items), _RUBRICA_LOTE_TAM)
@@ -1303,11 +1540,10 @@ def analizar_documento(
             )
             rubrica_acc = _merge_rubrica_por_codigo(rubrica_acc, parcial)
 
-        faltan = _codigos_faltantes(esperados, rubrica_acc)
+        faltan = _codigos_faltantes(esperados_llm, rubrica_acc)
         if faltan:
             por_codigo = {it["codigo"]: it for it in items}
             lote_retry = [por_codigo[c] for c in faltan if c in por_codigo]
-            # Reintento en sublotes
             for i in range(0, len(lote_retry), _RUBRICA_LOTE_TAM):
                 sub = lote_retry[i : i + _RUBRICA_LOTE_TAM]
                 parcial = _evaluar_lote_rubrica(
@@ -1317,24 +1553,64 @@ def analizar_documento(
                     nom=nom,
                     lote=sub,
                     lote_idx=i // _RUBRICA_LOTE_TAM + 1,
-                    total_lotes=max(1, (len(lote_retry) + _RUBRICA_LOTE_TAM - 1)
-                    // _RUBRICA_LOTE_TAM),
+                    total_lotes=max(
+                        1,
+                        (len(lote_retry) + _RUBRICA_LOTE_TAM - 1) // _RUBRICA_LOTE_TAM,
+                    ),
                     texto_doc=texto_doc,
                 )
                 rubrica_acc = _merge_rubrica_por_codigo(rubrica_acc, parcial)
 
-        data["rubrica"] = _reordenar_rubrica(esperados, rubrica_acc)
-
-        # Refuerzo del informe con cobertura
-        cubiertos = len(data["rubrica"])
-        total = len(esperados)
-        extra = (
-            f"\n\n### Cobertura de rúbrica\n"
-            f"Ítems evaluados: {cubiertos}/{total}."
+        # Huecos restantes → no_consta determinístico (nunca fallback posicional)
+        antes = len(rubrica_acc)
+        rubrica_acc = _completar_codigos_faltantes(
+            esperados_llm,
+            rubrica_acc,
+            motivo="código ausente tras lotes",
         )
-        data["informe_markdown"] = str(data.get("informe_markdown") or "") + extra
+        no_consta_fill = len(rubrica_acc) - antes
 
-    _recalcular_estatus(data, items)
+    orden = list(items_orden_completo or [])
+    if not orden:
+        orden = [str(r.get("id") or "") for r in rubrica_acc if isinstance(r, dict)]
+        orden.extend(it["codigo"] for it in items)
+        # unique preserve order
+        seen_o: set[str] = set()
+        orden_u: list[str] = []
+        for c in orden:
+            if c and c.lower() not in seen_o:
+                seen_o.add(c.lower())
+                orden_u.append(c)
+        orden = orden_u
+
+    if rubrica_acc or items:
+        data["rubrica"] = _reordenar_rubrica(orden, rubrica_acc)
+        cubiertos = len(data["rubrica"])
+        total = len(orden) or cubiertos
+        no_consta_n = sum(
+            1
+            for r in data["rubrica"]
+            if isinstance(r, dict)
+            and str(r.get("estado") or "").lower() in {"no_consta", "noconsta"}
+        )
+        # Cobertura técnica solo en metadata (el MD de usuario lo arma el builder).
+        data["cobertura_rubrica"] = {
+            "evaluados": cubiertos,
+            "total_tipo": total,
+            "no_consta": no_consta_n,
+            "relleno_deterministico": no_consta_fill,
+        }
+
+    _recalcular_estatus(data, list(items))
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    usage = snapshot_llm_usage()
+    data["metricas"] = {
+        "latencia_ms": elapsed_ms,
+        "tokens_prompt": usage.get("tokens_prompt", 0),
+        "tokens_completion": usage.get("tokens_completion", 0),
+        "tokens_total": usage.get("tokens_total", 0),
+        "llamadas_llm": usage.get("llamadas_llm", 0),
+    }
     return data
 
 
@@ -1434,18 +1710,86 @@ def consultar_juridico(
         if es_final
         else "Informe Ejecutivo Parcial de Avance"
     )
+    n_auditados = len(docs)
+    n_slots = len(sesion.checklist_slots or []) or 12
+
+    # JSON compacto para el Jurídico (menos tokens de entrada → más de salida).
+    from app.agents.cuestionario import _fundamento_para_json
+
+    def _pack_hallazgo(h: dict | Any) -> dict:
+        if isinstance(h, dict):
+            codigo = h.get("codigo_pregunta")
+            crit = h.get("rango_criticidad")
+            accion = h.get("accion_legal")
+            adv = h.get("advertencia_gerencia")
+            fund_src = h.get("fundamento_legal")
+        else:
+            codigo = getattr(h, "codigo_pregunta", None)
+            crit = getattr(h, "rango_criticidad", None)
+            accion = getattr(h, "accion_legal", None)
+            adv = getattr(h, "advertencia_gerencia", None)
+            fund_src = getattr(h, "fundamento_legal", None)
+        fund = _fundamento_para_json(fund_src, accion=accion, max_chars=280)
+        return {
+            "codigo": codigo,
+            "criticidad": crit,
+            "fundamento": fund,
+            "accion": str(accion)[:220] if accion else None,
+            "advertencia": str(adv)[:160] if adv else None,
+        }
+
+    paquetes: list[dict] = []
+    for d in docs:
+        src = getattr(d, "json_analista", None)
+        if isinstance(src, dict):
+            paquetes.append(
+                {
+                    "documento": src.get("documento_evaluado") or d.nombre_archivo,
+                    "estatus": src.get("estatus_global"),
+                    "hallazgos": [
+                        _pack_hallazgo(h)
+                        for h in (src.get("hallazgos") or [])
+                        if isinstance(h, dict)
+                    ],
+                }
+            )
+        else:
+            paquetes.append(
+                {
+                    "documento": d.nombre_archivo,
+                    "estatus": d.estatus_global
+                    or ("Verde" if d.cumple else "Amarillo"),
+                    "hallazgos": [
+                        _pack_hallazgo(h)
+                        for h in (getattr(d, "hallazgos", None) or [])
+                    ],
+                }
+            )
 
     kb_jur = _bloque_basamento(
         _fundamentos_sesion(sesion),
-        limite_chars=2_500,
+        limite_chars=1_200,
     )
-    # El prompt experto es largo; no duplicar restricciones kilométricas.
     system = (
         f"{system_experto}\n\n"
-        f"Alcance: {alcance} → emite «{titulo}». "
-        "Si es PARCIAL, no lo presentes como definitivo. "
-        "Cita normas SOLO del basamento recuperado o de los hallazgos; "
-        "si falta el texto, fundamento pendiente. SOLO markdown.\n"
+        f"Emite «{titulo}» (alcance={alcance}). "
+        f"Documentos auditados: {n_auditados}/{n_slots}. "
+        "Si es PARCIAL, indícalo; lista pendientes; advierte que puntaje y "
+        "cadena de nulidad pueden cambiar.\n"
+        "Estructura OBLIGATORIA (exactamente estas 4 secciones markdown):\n"
+        "## 1. Alcance y Metodología\n"
+        "## 2. Resultados Cuantitativos\n"
+        "## 3. Análisis de Interrelación (Cadena de Nulidad)\n"
+        "## 4. Conclusión, Solución y Llamado a la Acción\n"
+        "LÍMITE DE EXTENSIÓN: máximo ~1.400 palabras en total. "
+        "Sección 1: 1 párrafo. Sección 2: tabla breve + 2-3 frases (flag/umbrales). "
+        "Sección 3: 2 párrafos (raíz + contaminación a docs pendientes). "
+        "Sección 4: 1 párrafo de conclusión + 1 párrafo de medidas (paralización/"
+        "subsanación/responsables). "
+        "Prosa continua; no copies el texto de las preguntas; cita solo códigos "
+        "y artículos. Criticidad 5/3/1; Flag de Nulidad Absoluta si hay crítico 5. "
+        "Cita normas SOLO del basamento o de los hallazgos. "
+        "OBLIGATORIO: termina la sección 4 con una frase completa; no cortes a media idea.\n"
         f"{kb_jur}"
     )
     user = (
@@ -1453,14 +1797,90 @@ def consultar_juridico(
         f"Expediente {sesion.nomenclatura} — {mod_txt} — {tipo_txt}.\n"
         f"Checklist:\n{checklist_txt}\n"
         f"Pendientes: {slots_pendientes or []}\n\n"
-        f"{expediente_txt}"
+        f"Hallazgos del Analista (compacto):\n"
+        f"{json.dumps(paquetes, ensure_ascii=False)}\n\n"
+        f"Resumen expediente:\n{expediente_txt}"
     )
-    return _llamar_modelo(
+    reset_llm_usage()
+    texto, finish = _llamar_modelo_meta(
         system=system,
         user_content=user,
-        max_tokens=2500,
-        timeout=110.0,
+        max_tokens=8192,
+        timeout=180.0,
     )
+    # Si el modelo corta por max tokens / salida incompleta, continuar 1-2 veces.
+    for cont in range(2):
+        if not _dictamen_parece_truncado(texto, finish_reason=finish):
+            break
+        logger.warning(
+            "Dictamen jurídico truncado (finish=%s, chars=%s); continuación %s/2",
+            finish,
+            len(texto or ""),
+            cont + 1,
+        )
+        cola = (texto or "")[-900:]
+        cont_user = (
+            "Tu respuesta anterior quedó INCOMPLETA (cortada a media frase). "
+            "Continúa EXACTAMENTE desde donde se interrumpió, sin repetir "
+            "párrafos ya escritos. Termina la sección 4 con conclusión y "
+            "llamado a la acción en prosa breve.\n\n"
+            f"Final del texto previo:\n…{cola}"
+        )
+        extra, finish = _llamar_modelo_meta(
+            system=(
+                "Eres el mismo redactor del dictamen jurídico. Solo CONTINÚA "
+                "el markdown incompleto hasta cerrar la sección 4. No reinicies "
+                "el informe ni repitas títulos ya emitidos salvo que falte el "
+                "encabezado de la sección 4."
+            ),
+            user_content=cont_user,
+            max_tokens=2048,
+            timeout=120.0,
+        )
+        if not (extra or "").strip():
+            break
+        texto = _empalmar_dictamen(texto, extra)
+    return texto
+
+
+def _dictamen_parece_truncado(texto: str | None, *, finish_reason: str | None) -> bool:
+    """Heurística: corte por tokens o sección 4 incompleta."""
+    fr = (finish_reason or "").lower()
+    if fr in {"length", "max_tokens", "other"}:
+        return True
+    t = (texto or "").strip()
+    if not t:
+        return True
+    if "## 4" not in t and "Conclusión" not in t:
+        return True
+    # Termina a media preposición / artículo citado
+    if re.search(
+        r"(?:\b(?:de|del|la|el|los|las|en|con|por|Art(?:ículo|\.)?|y|e)\s*)$",
+        t,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    # Sin punto/cierre razonable al final
+    if t[-1] not in ".!?:»\"" and not t.endswith("```"):
+        return True
+    return False
+
+
+def _empalmar_dictamen(previo: str, continuacion: str) -> str:
+    """Une el tramo cortado con la continuación del modelo."""
+    a = (previo or "").rstrip()
+    b = (continuacion or "").strip()
+    # Quitar fences / reinicios evidentes
+    b = re.sub(r"^```(?:markdown)?\s*", "", b, flags=re.IGNORECASE)
+    b = re.sub(r"\s*```$", "", b)
+    # Si la continuación reedita desde un ##, conservar desde ahí solo si
+    # el previo no tenía esa sección; si no, pegar en bruto.
+    if b.startswith("#") and "## 4" in a and b.lstrip("#").lstrip().startswith("4"):
+        # Reemplazar sección 4 incompleta
+        idx = a.rfind("## 4")
+        if idx >= 0:
+            return (a[:idx].rstrip() + "\n\n" + b).rstrip() + "\n"
+    return (a + " " + b).rstrip() + "\n"
 
 
 def generar_informe_global(sesion: SesionCompliance) -> str:

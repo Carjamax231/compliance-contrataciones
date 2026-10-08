@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from app.agents.knowledge.storage import leer_texto, listar_basamento_rel_paths
+
 logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -163,19 +165,16 @@ def _chunks_libres(markdown: str, fuente: str, instrumento: str) -> list[Extract
 
 @lru_cache(maxsize=1)
 def _indice() -> tuple[Extracto, ...]:
-    if not _BASAMENTO_DIR.is_dir():
-        logger.warning("No existe carpeta de basamento: %s", _BASAMENTO_DIR)
+    rels = listar_basamento_rel_paths(_BASAMENTO_DIR)
+    if not rels:
+        logger.warning("No hay MD de basamento (local/GCS)")
         return tuple()
     items: list[Extracto] = []
-    for path in sorted(_BASAMENTO_DIR.rglob("*.md")):
-        if path.name.upper() == "README.MD":
+    for rel in rels:
+        path = _BASAMENTO_DIR / rel
+        text = leer_texto(local_path=path, gcs_blob=rel, kind="basamento")
+        if not text:
             continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            logger.warning("No se pudo leer %s: %s", path, exc)
-            continue
-        rel = str(path.relative_to(_BASAMENTO_DIR))
         inst = _instrumento_de_path(path)
         arts = _split_articulos(text, rel, inst)
         if arts:

@@ -131,8 +131,32 @@ class Observacion(BaseModel):
     advertencia_gerencia: str | None = None
 
 
+class HallazgoAnalista(BaseModel):
+    """Hallazgo estructurado (Parte 2 Mariana) para Nest / agente Jurídico."""
+
+    codigo_pregunta: str
+    pregunta_evaluada: str
+    fundamento_legal: str | None = None
+    rango_criticidad: str | None = None
+    accion_legal: str | None = None
+    advertencia_gerencia: str | None = None
+    estado: Literal["no", "parcial", "no_consta"] | None = None
+    respuesta: str | None = None
+    ref: str | None = None
+
+
+class MetricasAnalisis(BaseModel):
+    """Latencia y tokens de un análisis (sandbox / observabilidad)."""
+
+    latencia_ms: int = 0
+    tokens_prompt: int = 0
+    tokens_completion: int = 0
+    tokens_total: int = 0
+    llamadas_llm: int = 0
+
+
 class PreguntaSeguimiento(BaseModel):
-    """Ítem de rúbrica: el Analista responde contra el documento (no el usuario)."""
+    """Ítem de rúbrica interna: el Analista responde contra el documento."""
 
     id: str
     texto: str
@@ -214,6 +238,9 @@ class DocumentoAnalizado(BaseModel):
     fecha_analisis: datetime
     informe_markdown: str = ""
     preguntas_seguimiento: list[PreguntaSeguimiento] = Field(default_factory=list)
+    hallazgos: list[HallazgoAnalista] = Field(default_factory=list)
+    json_analista: dict | None = None
+    metricas: MetricasAnalisis | None = None
     tipo_coincide: bool = True
     tipo_detectado: str | None = None
     texto_extraido: str = ""
@@ -308,6 +335,21 @@ class AnalisisDocumentoResponse(BaseModel):
     documento: DocumentoAnalizado
     mensaje: str
     slots_pendientes: list[TipoDocumento] = Field(default_factory=list)
+    metricas: MetricasAnalisis | None = None
+    json_analista: dict | None = None
+
+
+class SandboxAnalizarResponse(BaseModel):
+    """Respuesta consolidada del sandbox de prueba."""
+
+    sesion: SesionCompliance
+    documento: DocumentoAnalizado
+    informe_markdown: str
+    json_analista: dict
+    metricas: MetricasAnalisis
+    mensaje: str
+    items_evaluados: int = 0
+    items_excluidos_otro_tipo: int = 0
 
 
 class RespuestasDocumentoRequest(BaseModel):
