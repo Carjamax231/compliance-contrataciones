@@ -42,6 +42,8 @@ async def analizar(
 
     def procesar(ruta: str, nombre: str) -> AnalisisSinEstadoResponse:
         documento = _analizar_archivo(sesion, tipo_documento, ruta, nombre)
+        # Un solo valor para el resumen y para la respuesta: nunca se contradicen.
+        estatus = documento.estatus_global or "Amarillo"
         informe = informe_documento_descargable(
             documento.informe_markdown or "",
             nomenclatura=nomenclatura,
@@ -49,13 +51,15 @@ async def analizar(
             tipo_contratacion=tipo_contratacion,
             tipo_documento=tipo_documento,
             nombre_archivo=documento.nombre_archivo,
-            estatus_global=documento.estatus_global or "Amarillo",
+            estatus_global=estatus,
             fecha=documento.fecha_analisis,
+            tipo_coincide=documento.tipo_coincide,
+            tipo_detectado=documento.tipo_detectado,
         )
         return AnalisisSinEstadoResponse(
             json_analista=documento.json_analista,
             informe_markdown=informe,
-            estatus_global=documento.estatus_global,
+            estatus_global=estatus,
             tipo_coincide=documento.tipo_coincide,
             tipo_detectado=documento.tipo_detectado,
             metricas=documento.metricas,

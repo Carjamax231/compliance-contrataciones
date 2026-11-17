@@ -492,6 +492,8 @@ def informe_documento_descargable(
     nombre_archivo: str,
     estatus_global: str,
     fecha: datetime,
+    tipo_coincide: bool = True,
+    tipo_detectado: str | None = None,
 ) -> str:
     """Resumen de un documento con título y datos del expediente, para descargarlo solo."""
     from app.agents.knowledge import (
@@ -502,6 +504,22 @@ def informe_documento_descargable(
 
     fecha_local = fecha.astimezone(_HORA_VENEZUELA).strftime("%d/%m/%Y")
     cuerpo = re.sub(r"^#\s+", "## ", (cuerpo or "").strip())
+    if not tipo_coincide:
+        esperado = etiqueta_documento(tipo_documento)
+        try:
+            detectado = etiqueta_documento(TipoDocumento(tipo_detectado))
+        except ValueError:
+            detectado = (tipo_detectado or "").strip()
+        aviso = (
+            f"**El archivo no corresponde al tipo de documento esperado.** "
+            f"Se cargó como «{esperado}»"
+            + (f", pero su contenido corresponde a «{detectado}»" if detectado else "")
+            + ". Por eso no se evaluó el cuestionario de este documento. "
+            f"Verifique que subió el archivo correcto y vuelva a cargarlo como «{esperado}»."
+        )
+        cuerpo = f"{aviso}\n\n{cuerpo}" if cuerpo else aviso
+    elif not cuerpo:
+        cuerpo = "No se generó el detalle de la revisión para este documento."
     return (
         f"# Resumen de revisión: {etiqueta_documento(tipo_documento)}\n\n"
         f"- **Expediente:** {nomenclatura}\n"
