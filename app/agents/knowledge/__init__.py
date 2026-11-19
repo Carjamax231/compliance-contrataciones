@@ -312,7 +312,10 @@ def _rama_contratacion_directa() -> RamaKnowledge:
                     "Informe de Opinión Comisión de Contrataciones",
                 ),
                 (TipoDocumento.ADJUDICACION_O_EQUIVALENTE, "Adjudicación o Equivalente"),
-                (TipoDocumento.NOTIFICACION_INTERESADOS, "Notificación a Interesados"),
+                (
+                    TipoDocumento.NOTIFICACION_INTERESADOS,
+                    "Notificación de la Adjudicación (solo al beneficiario, art. 126 RLCP)",
+                ),
                 (
                     TipoDocumento.CONTRATO,
                     "Contrato, Orden de Compra u Orden de Servicio",

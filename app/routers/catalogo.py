@@ -19,7 +19,10 @@ router = APIRouter(prefix="/catalogo", tags=["catalogo"])
 
 _CUESTIONARIOS = Path(__file__).resolve().parents[2] / "cuestionarios"
 # Modalidades revisadas por el equipo legal con un expediente completo.
-_VALIDADAS = {Modalidad.CA_ACTO_UNICO_APERTURA_UNICA}
+_VALIDADAS = {
+    Modalidad.CA_ACTO_UNICO_APERTURA_UNICA,
+    Modalidad.CONTRATACION_DIRECTA,
+}
 
 
 def _estado(modalidad: Modalidad) -> str:
