@@ -365,3 +365,13 @@ Artículo 91\. Sin perjuicio de la responsabilidad civil o penal, y de lo que di
 Ley Contra la Corrupción  
 Artículo 18\. Las funcionarias públicas, funcionarios públicos, empleadas públicas y empleados públicos deben administrar, manejar y custodiar el patrimonio público con criterios de racionalidad y eficiencia, procurando la disminución del gasto y la óptima utilización e inversión de los recursos disponibles, en atención a los fines públicos.
 
+CDANAD.19 ¿La notificación de la adjudicación fue dirigida únicamente al beneficiario de la adjudicación, sin incluir como destinatarios a otros oferentes o terceros?  
+RANGO DE CRITICIDAD: RELEVANTE (3)  
+Respuesta: SI; NO; N/A  
+**APLICA_A:** TODOS  
+ACCIÓN LEGAL: Practicar una nueva notificación dirigida únicamente al beneficiario de la adjudicación y dejar constancia en el expediente de la notificación practicada indebidamente a terceros.  
+ADVERTENCIA PARA LA GERENCIA: En la Contratación Directa el Reglamento solo prevé notificar al beneficiario de la adjudicación. Notificar a otros oferentes o a terceros comunica información del procedimiento a quien no es parte de él y puede dar lugar a reclamos o recursos sin base legal.  
+FUNDAMENTO LEGAL VIOLENTADO EN CASO DE "NO":  
+Normativa Principal   
+Reglamento de la Ley de Contrataciones Públicas (RLCP)  
+Artículo 126\. En las modalidades de selección de Contratistas realizadas mediante Consulta de Precios y Contratación Directa se notificará únicamente al beneficiario de la adjudicación.  
